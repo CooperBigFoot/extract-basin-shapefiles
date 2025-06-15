@@ -132,6 +132,7 @@ def extract_basin_shapefiles(
     snap_dist: float = 1000,
     target_utm_zone: int = None,
     big_tiff: bool = False,
+    keep_temp_dir_on_fail: bool = False,
 ) -> str:
     """Extract watershed basins for gauge points using D8 flow analysis.
 
@@ -148,6 +149,8 @@ def extract_basin_shapefiles(
             will auto-detect optimal zone for geographic data. Defaults to None.
         big_tiff: Whether to create BigTIFF format for large files (>4GB).
             Defaults to False.
+        keep_temp_dir_on_fail: Whether to preserve temporary directory on failure
+            for debugging purposes. Defaults to False.
 
     Returns:
         Path to final watersheds shapefile.
@@ -193,10 +196,12 @@ def extract_basin_shapefiles(
 
     except Exception as e:
         logger.error(f"Watershed delineation failed: {e}")
+        if keep_temp_dir_on_fail:
+            logger.info(f"Preserving temporary directory for debugging: {temp_dir}")
         raise RuntimeError(f"Watershed delineation failed: {e}") from e
 
     finally:
-        _cleanup_temp_files(temp_dir)
+        _cleanup_temp_files(temp_dir, keep_on_fail=keep_temp_dir_on_fail)
 
 
 def _condition_dem(temp_dir: Path, temp_dem: Path, breach_dist: int, big_tiff: bool = False) -> Path:
@@ -679,8 +684,17 @@ def _save_final_outputs(final_watersheds: gpd.GeoDataFrame, snapped_points: Path
         raise RuntimeError(f"Failed to save outputs: {e}") from e
 
 
-def _cleanup_temp_files(temp_dir: Path) -> None:
-    """Clean up temporary processing files."""
+def _cleanup_temp_files(temp_dir: Path, keep_on_fail: bool = False) -> None:
+    """Clean up temporary processing files.
+    
+    Args:
+        temp_dir: Path to temporary directory
+        keep_on_fail: Whether to preserve temp files (used when called after failure)
+    """
+    if keep_on_fail:
+        logger.info(f"Temporary files preserved at: {temp_dir}")
+        return
+        
     logger.info("Cleaning up temporary files")
     try:
         if temp_dir.exists():
