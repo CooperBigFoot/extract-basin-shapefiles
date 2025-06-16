@@ -181,10 +181,10 @@ def extract_basin_shapefiles(
         total_gauges = len(gauges_gdf)
         logger.info(f"Processing {total_gauges} gauges")
 
-        all_watersheds = _process_watersheds(gauges_gdf, flow_pointer, temp_dir, big_tiff)
+        all_watersheds, gauge_mapping = _process_watersheds(gauges_gdf, flow_pointer, temp_dir, big_tiff)
 
         if all_watersheds is not None and not all_watersheds.empty:
-            final_watersheds = _add_gauge_attributes(all_watersheds, gauges_gdf)
+            final_watersheds = _map_gauge_attributes_by_value(all_watersheds, gauge_mapping)
             final_watersheds["AREA_KM2"] = final_watersheds.geometry.area / 1_000_000
 
             final_output = _save_final_outputs(final_watersheds, snapped_points, output_dir)
@@ -326,8 +326,12 @@ def _snap_points(temp_dir: Path, gauges: Path, streams: Path, snap_dist: float) 
 
 def _process_watersheds(
     gauges_gdf: gpd.GeoDataFrame, d8_pointer: Path, temp_dir: Path, big_tiff: bool = False
-) -> gpd.GeoDataFrame:
-    """Process watersheds using UnnestBasins tool."""
+) -> tuple[gpd.GeoDataFrame, dict]:
+    """Process watersheds using UnnestBasins tool.
+
+    Returns:
+        Tuple of (watersheds GeoDataFrame, gauge mapping dictionary)
+    """
     logger.info("Processing watersheds using UnnestBasins tool")
 
     with rasterio.open(d8_pointer) as src:
@@ -337,7 +341,16 @@ def _process_watersheds(
     wbt.work_dir = str(temp_dir)
     wbt.verbose = True
 
-    # Save gauges without FID column
+    # Create gauge mapping dictionary before processing
+    # UnnestBasins assigns VALUE = record_index + 1 (1-based indexing)
+    gauge_mapping = {}
+    for idx, (_, gauge_row) in enumerate(gauges_gdf.iterrows()):
+        value_id = idx + 1  # UnnestBasins uses 1-based indexing
+        gauge_mapping[value_id] = gauge_row.to_dict()
+
+    logger.info(f"Created gauge mapping for {len(gauge_mapping)} gauges with VALUE IDs 1-{len(gauge_mapping)}")
+
+    # Save gauges without FID column - order is critical for UnnestBasins
     gauges_path = temp_dir / "all_gauges.shp"
     gauges_gdf.to_file(gauges_path)
 
@@ -379,38 +392,107 @@ def _process_watersheds(
     if all_basin_parts:
         ws_shp = pd.concat(all_basin_parts, ignore_index=True)
         logger.info(f"Successfully processed {len(ws_shp)} total watershed polygons")
-        return ws_shp
+        return ws_shp, gauge_mapping
     else:
         raise RuntimeError("No valid watersheds were processed")
 
 
-def _add_gauge_attributes(watersheds_gdf: gpd.GeoDataFrame, gauges_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """Add gauge attributes to watersheds by spatial join."""
-    logger.info("Adding gauge attributes to watersheds")
+def _map_gauge_attributes_by_value(watersheds_gdf: gpd.GeoDataFrame, gauge_mapping: dict) -> gpd.GeoDataFrame:
+    """Map gauge attributes to watersheds using VALUE field from UnnestBasins.
 
-    try:
-        # Create centroid points for watersheds
-        watersheds_copy = watersheds_gdf.copy()
-        watersheds_copy["centroid"] = watersheds_copy.geometry.centroid
+    Args:
+        watersheds_gdf: Watershed polygons with VALUE field from UnnestBasins
+        gauge_mapping: Dictionary mapping VALUE IDs to gauge attributes
 
-        # Create temporary GeoDataFrame with centroid geometry
-        watershed_centroids = gpd.GeoDataFrame(
-            watersheds_copy.drop(columns=["geometry"]), geometry=watersheds_copy["centroid"], crs=watersheds_copy.crs
+    Returns:
+        Watersheds GeoDataFrame with gauge attributes added
+    """
+    logger.info("Mapping gauge attributes to watersheds using VALUE field")
+
+    # Validate VALUE field exists
+    if "VALUE" not in watersheds_gdf.columns:
+        raise RuntimeError("VALUE field not found in watershed data - UnnestBasins may have failed")
+
+    # Get unique VALUES and validate mapping
+    watershed_values = set(watersheds_gdf["VALUE"].dropna().astype(int))
+    available_values = set(gauge_mapping.keys())
+
+    logger.info(f"Found {len(watershed_values)} unique watershed VALUE IDs: {sorted(watershed_values)}")
+    logger.info(f"Available gauge mappings for VALUE IDs: {sorted(available_values)}")
+
+    # Check for missing mappings
+    missing_values = watershed_values - available_values
+    if missing_values:
+        logger.warning(
+            f"WARNING: {len(missing_values)} watersheds have VALUE IDs without gauge mappings: {sorted(missing_values)}"
         )
 
-        # Spatial join - find nearest gauge for each watershed centroid
-        joined = gpd.sjoin_nearest(watershed_centroids, gauges_gdf, how="left", distance_col="distance")
+    # Check for unused mappings
+    unused_values = available_values - watershed_values
+    if unused_values:
+        logger.info(
+            f"INFO: {len(unused_values)} gauges did not generate watersheds (VALUE IDs: {sorted(unused_values)})"
+        )
 
-        # Remove the temporary columns and restore original geometry
-        joined = joined.drop(columns=["centroid", "distance", "index_right"])
-        joined["geometry"] = watersheds_copy["geometry"].values
+    # Create result DataFrame with gauge attributes
+    result_rows = []
+    successful_mappings = 0
+    failed_mappings = 0
 
-        logger.info(f"Successfully added gauge attributes to {len(joined)} watersheds")
-        return joined
+    for idx, row in watersheds_gdf.iterrows():
+        try:
+            value_id = int(row["VALUE"])
 
-    except Exception as e:
-        logger.warning(f"Failed to add gauge attributes: {e}")
-        return watersheds_gdf
+            if value_id in gauge_mapping:
+                # Get gauge attributes
+                gauge_attrs = gauge_mapping[value_id].copy()
+
+                # Combine watershed geometry with gauge attributes
+                result_row = gauge_attrs.copy()
+                result_row["geometry"] = row["geometry"]
+                result_row["VALUE"] = value_id
+
+                result_rows.append(result_row)
+                successful_mappings += 1
+            else:
+                logger.warning(f"No gauge mapping found for watershed VALUE {value_id}")
+                failed_mappings += 1
+
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Invalid VALUE field in watershed {idx}: {row.get('VALUE', 'N/A')} - {e}")
+            failed_mappings += 1
+
+    if not result_rows:
+        raise RuntimeError("No valid watershed-gauge mappings were created")
+
+    # Create final GeoDataFrame
+    result_gdf = gpd.GeoDataFrame(result_rows, crs=watersheds_gdf.crs)
+
+    logger.info(f"Successfully mapped {successful_mappings} watersheds to gauges")
+    if failed_mappings > 0:
+        logger.warning(f"Failed to map {failed_mappings} watersheds")
+
+    # Validate 1:1 mapping
+    gauge_counts = result_gdf.groupby("VALUE").size()
+    duplicate_values = gauge_counts[gauge_counts > 1]
+    if not duplicate_values.empty:
+        logger.warning(f"WARNING: Found duplicate VALUE assignments: {duplicate_values.to_dict()}")
+    else:
+        logger.info("✓ Confirmed 1:1 watershed-to-gauge mapping (no duplicates)")
+
+    return result_gdf
+
+
+def _add_gauge_attributes(watersheds_gdf: gpd.GeoDataFrame, gauges_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """DEPRECATED: This function has been replaced by _map_gauge_attributes_by_value().
+
+    The spatial join approach caused duplicate gauge assignments.
+    Use VALUE-based mapping instead for reliable 1:1 relationships.
+    """
+    logger.warning(
+        "DEPRECATED: _add_gauge_attributes() should not be called. Use _map_gauge_attributes_by_value() instead."
+    )
+    return watersheds_gdf
 
 
 def _validate_inputs(dem_path: Path, gauges_path: Path, breach_dist: int, snap_dist: float) -> None:
@@ -686,7 +768,7 @@ def _save_final_outputs(final_watersheds: gpd.GeoDataFrame, snapped_points: Path
 
 def _cleanup_temp_files(temp_dir: Path, keep_on_fail: bool = False) -> None:
     """Clean up temporary processing files.
-    
+
     Args:
         temp_dir: Path to temporary directory
         keep_on_fail: Whether to preserve temp files (used when called after failure)
@@ -694,7 +776,7 @@ def _cleanup_temp_files(temp_dir: Path, keep_on_fail: bool = False) -> None:
     if keep_on_fail:
         logger.info(f"Temporary files preserved at: {temp_dir}")
         return
-        
+
     logger.info("Cleaning up temporary files")
     try:
         if temp_dir.exists():
