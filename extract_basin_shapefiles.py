@@ -140,7 +140,7 @@ def extract_basin_shapefiles(
         dem_path: Path to input DEM raster file.
         gauges_shapefile_path: Path to input gauges point shapefile.
         output_directory: Path to output directory for final results.
-        breach_dist: Maximum distance for depression breaching. Defaults to 5.
+        breach_dist: Maximum distance for depression breaching in cells. Defaults to 5.
         stream_extract_threshold: Flow accumulation threshold for stream
             extraction. Defaults to 100.
         snap_dist: Maximum distance for snapping pour points to streams.
@@ -210,15 +210,8 @@ def _condition_dem(temp_dir: Path, temp_dem: Path, breach_dist: int, big_tiff: b
 
     with rasterio.open(temp_dem) as src:
         dem_crs = src.crs
-        # Get pixel size (assuming square pixels)
-        pixel_size = abs(src.transform[0])  # meters per pixel
 
-    # Convert breach distance from meters to cells
-    search_dist_cells = max(1, int(breach_dist / pixel_size))
-
-    logger.info(
-        f"Using breach search distance of {search_dist_cells} cells ({breach_dist}m at {pixel_size}m resolution)"
-    )
+    logger.info(f"Using breach search distance of {breach_dist} cells")
 
     wbt = whitebox.WhiteboxTools()
     wbt.work_dir = str(temp_dir)
@@ -229,7 +222,7 @@ def _condition_dem(temp_dir: Path, temp_dem: Path, breach_dist: int, big_tiff: b
     wbt.breach_depressions_least_cost(
         dem=str(temp_dem),
         output=str(breached_dem_raw),
-        dist=search_dist_cells,
+        dist=breach_dist,
         fill=True,
     )
 
