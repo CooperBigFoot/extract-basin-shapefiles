@@ -1,6 +1,6 @@
 # Watershed Basin Shapefile Extraction
 
-This script provides an optimized, parallel processing solution for delineating watershed basins from a Digital Elevation Model (DEM) and a set of gauge locations. It automates the hydrological conditioning of the DEM, stream network extraction, and watershed delineation using the `WhiteboxTools` library with advanced batching and multiprocessing capabilities.
+This script provides an automated solution for delineating watershed basins from a Digital Elevation Model (DEM) and a set of gauge locations. It automates the hydrological conditioning of the DEM, stream network extraction, and watershed delineation using the `WhiteboxTools` library with intelligent CRS optimization.
 
 ---
 
@@ -12,7 +12,7 @@ This script provides an optimized, parallel processing solution for delineating 
 - [Function Parameters](#function-parameters)
 - [Processing Steps](#processing-steps)
 - [Outputs](#outputs)
-- [Performance Features](#performance-features)
+- [Features](#features)
 
 ---
 
@@ -23,9 +23,10 @@ The script requires the following Python libraries:
 - `geopandas`
 - `rasterio`
 - `whitebox`
-- `multiprocessing` (built-in)
-- `concurrent.futures` (built-in)
+- `pandas`
+- `pyproj`
 - `pathlib` (built-in)
+- `logging` (built-in)
 
 ---
 
@@ -52,16 +53,17 @@ The script requires the following Python libraries:
 
 ## Usage
 
-The main function to use is `extract_basin_shapefiles`. This function takes paths to a DEM raster and a gauge location shapefile and performs the watershed analysis with optimized parallel processing.
+The script provides two main functions:
 
-To use it, follow the instructions in the `extract_basin_shapefiles` notebook.
+1. `extract_basin_shapefiles` - Complete workflow starting from raw DEM
+2. `extract_basin_shapefiles_from_filled_dem` - Workflow starting from pre-filled/conditioned DEM
 
 ### Basic Example
 
 ```python
-from extract_basin_shapefiles import extract_basin_shapefiles
+from extract_basin_shapefiles import extract_basin_shapefiles, extract_basin_shapefiles_from_filled_dem
 
-# Basic usage with default parameters
+# Basic usage with automatic UTM zone detection
 result = extract_basin_shapefiles(
     dem_path="path/to/dem.tif",
     gauges_shapefile_path="path/to/gauges.shp",
@@ -73,11 +75,18 @@ result = extract_basin_shapefiles(
     dem_path="path/to/dem.tif",
     gauges_shapefile_path="path/to/gauges.shp", 
     output_directory="path/to/output",
-    batch_size=100,
-    n_workers=8,
+    breach_dist=10,
     stream_extract_threshold=50,
     snap_dist=500,
-    use_watershed_function=True
+    target_utm_zone=32642,  # Manual UTM zone specification
+    big_tiff=True
+)
+
+# Usage with pre-filled DEM (skips conditioning step)
+result = extract_basin_shapefiles_from_filled_dem(
+    filled_dem_path="path/to/filled_dem.tif",
+    gauges_shapefile_path="path/to/gauges.shp",
+    output_directory="path/to/output"
 )
 ```
 
@@ -85,19 +94,32 @@ result = extract_basin_shapefiles(
 
 ## Function Parameters
 
-The `extract_basin_shapefiles` function accepts the following arguments:
+### `extract_basin_shapefiles`
 
 | Parameter | Type | Description | Default |
 | :--- | :--- | :--- | :--- |
 | `dem_path` | `str` or `Path` | Path to the input DEM raster file. | *Required* |
 | `gauges_shapefile_path` | `str` or `Path` | Path to the input point shapefile containing gauge locations. | *Required* |
 | `output_directory` | `str` or `Path` | Path to the directory where the final shapefiles will be saved. | *Required* |
-| `breach_dist` | `int` | The maximum distance (in pixels) for breaching depressions in the DEM. | `5` |
-| `stream_extract_threshold` | `int` | The flow accumulation threshold for extracting the stream network. Lower values = more detailed stream network. | `100` |
-| `snap_dist` | `float` | The maximum distance (in map units) to snap gauge points to the extracted stream network. | `1000` |
-| `batch_size` | `int` | Number of watersheds to process in each batch for parallel processing. | `50` |
-| `n_workers` | `int` | Number of parallel workers to use. If `None`, uses CPU count - 1. | `None` |
-| `use_watershed_function` | `bool` | Use optimized watershed function instead of unnest_basins method. Recommended for better performance. | `True` |
+| `breach_dist` | `int` | The maximum distance (in cells) for breaching depressions in the DEM. | `5` |
+| `stream_extract_threshold` | `int` | The flow accumulation threshold for extracting the stream network. | `100` |
+| `snap_dist` | `float` | The maximum distance (in map units) to snap gauge points to streams. | `1000` |
+| `target_utm_zone` | `int` | Optional UTM zone EPSG code. If None, auto-detects optimal zone. | `None` |
+| `big_tiff` | `bool` | Whether to create BigTIFF format for large files (>4GB). | `False` |
+| `keep_temp_dir_on_fail` | `bool` | Whether to preserve temporary files on failure for debugging. | `False` |
+
+### `extract_basin_shapefiles_from_filled_dem`
+
+| Parameter | Type | Description | Default |
+| :--- | :--- | :--- | :--- |
+| `filled_dem_path` | `str` or `Path` | Path to the pre-filled/conditioned DEM raster file. | *Required* |
+| `gauges_shapefile_path` | `str` or `Path` | Path to the input point shapefile containing gauge locations. | *Required* |
+| `output_directory` | `str` or `Path` | Path to the directory where the final shapefiles will be saved. | *Required* |
+| `stream_extract_threshold` | `int` | The flow accumulation threshold for extracting the stream network. | `100` |
+| `snap_dist` | `float` | The maximum distance (in map units) to snap gauge points to streams. | `1000` |
+| `target_utm_zone` | `int` | Optional UTM zone EPSG code. If None, auto-detects optimal zone. | `None` |
+| `big_tiff` | `bool` | Whether to create BigTIFF format for large files (>4GB). | `False` |
+| `keep_temp_dir_on_fail` | `bool` | Whether to preserve temporary files on failure for debugging. | `False` |
 
 ---
 
@@ -109,25 +131,26 @@ The watershed extraction process follows these main steps:
 
 - Validates input files and parameters
 - Creates temporary working directories
-- Sets up logging and multiprocessing environment
+- Sets up logging for process tracking
 
-### 2. **CRS Harmonization**
+### 2. **CRS Optimization & Harmonization**
 
-- Reads DEM and gauge shapefiles
-- Reprojects gauge points to match DEM coordinate system
-- Copies inputs to temporary working directory
+- **Automatic UTM zone detection**: Analyzes data bounds to select optimal UTM zone
+- **Manual UTM specification**: Option to specify target UTM zone
+- **CRS validation**: Ensures projected coordinate system with metric units
+- Reprojects DEM and gauge points to harmonized CRS for accurate analysis
 
-### 3. **DEM Conditioning**
+### 3. **DEM Conditioning** (skipped for filled DEM workflow)
 
-- **Optimized approach**: Uses `fill_depressions_wang_and_liu` for faster processing
-- **Fallback approach**: Uses traditional fill single cell pits + breach depressions
-- Removes spurious sinks and conditions the DEM for flow analysis
+- Uses least-cost breaching algorithm to remove depressions
+- Configurable breach distance for different terrain types
+- Creates hydrologically correct DEM for flow analysis
 
 ### 4. **Flow Analysis**
 
 - Calculates D8 flow direction (pointer) using all available CPU cores
 - Computes flow accumulation from flow direction
-- Uses optimized WhiteboxTools settings for maximum performance
+- Uses WhiteboxTools with maximum processor utilization
 
 ### 5. **Stream Network Extraction**
 
@@ -137,34 +160,31 @@ The watershed extraction process follows these main steps:
 
 ### 6. **Point Snapping**
 
-- Snaps all gauge points to the nearest stream pixels
-- Uses Jenson snap pour points algorithm
-- Ensures watershed outlets are located on the stream network
+- Snaps gauge points to nearest stream pixels using Jenson algorithm
+- Fallback to original locations if snapping fails
+- Ensures watershed outlets are properly positioned
 
-### 7. **Watershed Delineation (Parallel Processing)**
+### 7. **Watershed Delineation**
 
-- Splits gauge points into batches for parallel processing
-- **Method A** (default): Uses `watershed` function for multiple points simultaneously
-- **Method B** (fallback): Uses `unnest_basins` for individual watershed processing
-- Processes batches across multiple CPU cores
+- Uses WhiteboxTools `UnnestBasins` function for multiple watershed processing
+- Processes all gauge points simultaneously for efficiency
+- Maintains 1:1 relationship between gauges and watersheds
 
 ### 8. **Results Integration**
 
-- Merges watershed results from all batches
-- Adds original gauge attributes to watershed polygons
+- Maps gauge attributes to watersheds using VALUE-based linking
 - Calculates watershed areas in km²
-- Ensures unique identifiers across all watersheds
+- Validates 1:1 gauge-to-watershed relationships
 
 ### 9. **Output Generation**
 
 - Saves final watershed polygons shapefile
 - Saves snapped gauge points shapefile
-- Provides summary statistics and completion status
+- Creates CRS information file for reference
 
 ### 10. **Cleanup**
 
-- Removes temporary processing files
-- Cleans up batch-specific directories
+- Removes temporary processing files (unless debugging)
 - Preserves only final output files
 
 ---
@@ -177,56 +197,55 @@ The function generates the following output files in the specified output direct
 | :--- | :--- |
 | `watersheds.shp` | Final watershed polygons with gauge attributes and calculated areas |
 | `gauges_snapped.shp` | Gauge points snapped to the stream network |
+| `crs_info.txt` | Information about the coordinate reference system used |
 
 ### Watershed Attributes
 
 The output watershed shapefile includes:
 
 - **Original gauge attributes**: All attributes from the input gauge shapefile
-- **FID**: Unique identifier for each watershed
+- **VALUE**: Unique identifier linking watershed to original gauge
 - **AREA_KM2**: Calculated watershed area in square kilometers
-- **batch_id**: Batch processing identifier (for debugging)
 
 ---
 
-## 🚀 Performance Features
+## 🚀 Features
 
-### **Parallel Processing**
+### **Intelligent CRS Management**
 
-- Utilizes multiple CPU cores for watershed delineation
-- Automatic detection of available processors
-- Configurable batch sizes to optimize memory usage
+- Automatic UTM zone detection for optimal hydrological analysis
+- Geographic bounds analysis to select appropriate projection
+- Manual UTM zone override capability
+- Cross-hemisphere data handling
 
-### **Optimized Algorithms**
+### **Robust Processing**
 
-- Uses fastest available WhiteboxTools functions
-- Wang & Liu depression filling algorithm for large DEMs
-- D8 flow analysis with maximum processor utilization
-
-### **Memory Management**
-
-- Batch processing prevents memory overflow with large datasets
-- Temporary file cleanup to manage disk space
-- Efficient CRS handling and data harmonization
-
-### **Error Handling**
-
-- Comprehensive error logging and recovery
+- Comprehensive error handling and logging
 - Fallback methods for algorithm failures
-- Individual batch failure isolation
+- Input validation and bounds checking
+- Temporary file management with cleanup
 
-### **Scalability**
+### **Flexible Workflow Options**
 
-- Handles datasets from dozens to thousands of gauge points
-- Configurable parameters for different system capabilities
-- Progress tracking and status reporting
+- Complete workflow from raw DEM
+- Pre-filled DEM workflow for efficiency
+- Configurable processing parameters
+- BigTIFF support for large datasets
+
+### **Quality Assurance**
+
+- 1:1 gauge-to-watershed relationship validation
+- Duplicate detection and reporting
+- Area calculations and validation
+- Comprehensive logging and status reporting
 
 ---
 
-## 📊 Performance Tips
+## 📊 Usage Tips
 
-- **For large DEMs**: Increase `batch_size` and ensure sufficient RAM
-- **For many gauge points**: Reduce `batch_size` to prevent memory issues  
-- **For detailed watersheds**: Lower `stream_extract_threshold` values
-- **For faster processing**: Keep `use_watershed_function=True` (default)
-- **For system optimization**: Set `n_workers` to match your CPU capabilities
+- **For large DEMs**: Enable `big_tiff=True` and ensure sufficient disk space
+- **For detailed watersheds**: Use lower `stream_extract_threshold` values (e.g., 50-100)
+- **For coarse analysis**: Use higher `stream_extract_threshold` values (e.g., 500-1000)
+- **For debugging**: Set `keep_temp_dir_on_fail=True` to examine intermediate files
+- **For efficiency**: Use pre-filled DEM workflow if you have multiple gauge sets for the same area
+- **For accuracy**: Let the system auto-detect UTM zones unless you have specific projection requirements

@@ -70,59 +70,6 @@ def detect_optimal_utm_zone(bounds: tuple[float, float, float, float]) -> int:
     return epsg_code
 
 
-def fix_whitebox_geotiff(input_path: Path, output_path: Path, target_crs: CRS = None, big_tiff: bool = False) -> Path:
-    """Fix corrupted GeoTIFF metadata from WhiteboxTools output.
-
-    Args:
-        input_path: Path to input raster with corrupted metadata
-        output_path: Path for output raster with fixed metadata
-        target_crs: Target CRS to apply. If None, attempts to preserve existing CRS
-        big_tiff: Whether to create BigTIFF format for large files
-    """
-    try:
-        if target_crs is not None:
-            crs_string = target_crs.to_string()
-        else:
-            try:
-                with rasterio.open(input_path) as src:
-                    if src.crs is not None:
-                        crs_string = src.crs.to_string()
-                    else:
-                        logger.warning(f"No CRS found in {input_path}, using EPSG:4326 as fallback")
-                        crs_string = "EPSG:4326"
-            except Exception:
-                logger.warning(f"Could not read CRS from {input_path}, using EPSG:4326 as fallback")
-                crs_string = "EPSG:4326"
-
-        cmd = [
-            "gdal_translate",
-            "-co",
-            "COMPRESS=LZW",
-            "-co",
-            "TILED=YES",
-        ]
-
-        if big_tiff:
-            cmd.extend(["-co", "BIGTIFF=YES"])
-
-        cmd.extend(
-            [
-                "-a_srs",
-                crs_string,
-                str(input_path),
-                str(output_path),
-            ]
-        )
-
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        logger.debug(f"Fixed GeoTIFF metadata with CRS {crs_string}: {output_path}")
-        return output_path
-
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to fix GeoTIFF metadata: {e.stderr}")
-        raise RuntimeError(f"GDAL translate failed: {e.stderr}") from e
-
-
 def extract_basin_shapefiles(
     dem_path: str | Path,
     gauges_shapefile_path: str | Path,
@@ -171,28 +118,9 @@ def extract_basin_shapefiles(
         logger.info("Pre-processing DEM")
         filled_dem = _condition_dem(temp_dir, temp_dem, breach_dist, big_tiff)
 
-        flow_pointer, flow_accum = _calculate_flow_analysis(temp_dir, filled_dem, big_tiff)
-
-        streams_raster = _extract_streams(temp_dir, flow_accum, stream_extract_threshold, big_tiff)
-
-        snapped_points = _snap_points(temp_dir, temp_gauges, streams_raster, snap_dist)
-
-        gauges_gdf = gpd.read_file(snapped_points)
-        total_gauges = len(gauges_gdf)
-        logger.info(f"Processing {total_gauges} gauges")
-
-        all_watersheds, gauge_mapping = _process_watersheds(gauges_gdf, flow_pointer, temp_dir, big_tiff)
-
-        if all_watersheds is not None and not all_watersheds.empty:
-            final_watersheds = _map_gauge_attributes_by_value(all_watersheds, gauge_mapping)
-            final_watersheds["AREA_KM2"] = final_watersheds.geometry.area / 1_000_000
-
-            final_output = _save_final_outputs(final_watersheds, snapped_points, output_dir)
-
-            logger.info(f"Completed! Total watersheds: {len(final_watersheds)}")
-            return str(final_output)
-        else:
-            raise RuntimeError("No watersheds were successfully processed")
+        return _run_delineation_workflow(
+            filled_dem, temp_gauges, output_dir, temp_dir, stream_extract_threshold, snap_dist, big_tiff
+        )
 
     except Exception as e:
         logger.error(f"Watershed delineation failed: {e}")
@@ -204,32 +132,137 @@ def extract_basin_shapefiles(
         _cleanup_temp_files(temp_dir, keep_on_fail=keep_temp_dir_on_fail)
 
 
+def extract_basin_shapefiles_from_filled_dem(
+    filled_dem_path: str | Path,
+    gauges_shapefile_path: str | Path,
+    output_directory: str | Path,
+    stream_extract_threshold: int = 100,
+    snap_dist: float = 1000,
+    target_utm_zone: int = None,
+    big_tiff: bool = False,
+    keep_temp_dir_on_fail: bool = False,
+) -> str:
+    """Extract watershed basins for gauge points using a pre-filled DEM and D8 flow analysis.
+
+    This function performs watershed delineation starting from a pre-filled (breached) DEM,
+    bypassing the initial DEM conditioning step. It reuses the same workflow as
+    extract_basin_shapefiles() but starts from flow analysis.
+
+    Args:
+        filled_dem_path: Path to input pre-filled/breached DEM raster file.
+        gauges_shapefile_path: Path to input gauges point shapefile.
+        output_directory: Path to output directory for final results.
+        stream_extract_threshold: Flow accumulation threshold for stream
+            extraction. Defaults to 100.
+        snap_dist: Maximum distance for snapping pour points to streams.
+            Defaults to 1000.
+        target_utm_zone: Optional UTM zone EPSG code (e.g., 32642). If None,
+            will auto-detect optimal zone for geographic data. Defaults to None.
+        big_tiff: Whether to create BigTIFF format for large files (>4GB).
+            Defaults to False.
+        keep_temp_dir_on_fail: Whether to preserve temporary directory on failure
+            for debugging purposes. Defaults to False.
+
+    Returns:
+        Path to final watersheds shapefile.
+    """
+    filled_dem_path = Path(filled_dem_path)
+    gauges_path = Path(gauges_shapefile_path)
+    output_dir = Path(output_directory)
+
+    _validate_inputs_for_filled_dem(filled_dem_path, gauges_path, snap_dist)
+
+    logger.info("Starting watershed delineation process using pre-filled DEM and D8 flow analysis")
+
+    temp_dir = _setup_working_environment(output_dir)
+
+    try:
+        temp_dem, temp_gauges = _validate_and_harmonize_crs(filled_dem_path, gauges_path, temp_dir, target_utm_zone)
+
+        logger.info("Processing pre-filled DEM - skipping conditioning step")
+
+        return _run_delineation_workflow(
+            temp_dem, temp_gauges, output_dir, temp_dir, stream_extract_threshold, snap_dist, big_tiff
+        )
+
+    except Exception as e:
+        logger.error(f"Watershed delineation failed: {e}")
+        if keep_temp_dir_on_fail:
+            logger.info(f"Preserving temporary directory for debugging: {temp_dir}")
+        raise RuntimeError(f"Watershed delineation failed: {e}") from e
+
+    finally:
+        _cleanup_temp_files(temp_dir, keep_on_fail=keep_temp_dir_on_fail)
+
+
+def _run_delineation_workflow(
+    filled_dem: Path,
+    temp_gauges: Path,
+    output_dir: Path,
+    temp_dir: Path,
+    stream_extract_threshold: int,
+    snap_dist: float,
+    big_tiff: bool = False,
+) -> str:
+    """Execute the core watershed delineation workflow.
+
+    This function contains the shared processing steps used by both
+    extract_basin_shapefiles() and extract_basin_shapefiles_from_filled_dem().
+
+    Args:
+        filled_dem: Path to conditioned/filled DEM raster
+        temp_gauges: Path to harmonized gauges shapefile
+        output_dir: Path to output directory
+        temp_dir: Path to temporary processing directory
+        stream_extract_threshold: Flow accumulation threshold for stream extraction
+        snap_dist: Maximum distance for snapping pour points to streams
+        big_tiff: Whether to create BigTIFF format for large files
+
+    Returns:
+        Path to final watersheds shapefile
+    """
+    flow_pointer, flow_accum = _calculate_flow_analysis(temp_dir, filled_dem, big_tiff)
+
+    streams_raster = _extract_streams(temp_dir, flow_accum, stream_extract_threshold, big_tiff)
+
+    snapped_points = _snap_points(temp_dir, temp_gauges, streams_raster, snap_dist)
+
+    gauges_gdf = gpd.read_file(snapped_points)
+    total_gauges = len(gauges_gdf)
+    logger.info(f"Processing {total_gauges} gauges")
+
+    all_watersheds, gauge_mapping = _process_watersheds(gauges_gdf, flow_pointer, temp_dir, big_tiff)
+
+    if all_watersheds is not None and not all_watersheds.empty:
+        final_watersheds = _map_gauge_attributes_by_value(all_watersheds, gauge_mapping)
+        final_watersheds["AREA_KM2"] = final_watersheds.geometry.area / 1_000_000
+
+        final_output = _save_final_outputs(final_watersheds, snapped_points, output_dir)
+
+        logger.info(f"Completed! Total watersheds: {len(final_watersheds)}")
+        return str(final_output)
+    else:
+        raise RuntimeError("No watersheds were successfully processed")
+
+
 def _condition_dem(temp_dir: Path, temp_dem: Path, breach_dist: int, big_tiff: bool = False) -> Path:
     """DEM conditioning using least-cost breaching."""
     logger.info("Conditioning DEM using least-cost breaching")
-
-    with rasterio.open(temp_dem) as src:
-        dem_crs = src.crs
-
-    logger.info(f"Using breach search distance of {breach_dist} cells")
 
     wbt = whitebox.WhiteboxTools()
     wbt.work_dir = str(temp_dir)
     wbt.verbose = True
     wbt.max_procs = -1
 
-    breached_dem_raw = temp_dir / "dem_breached_raw.tif"
+    breached_dem = temp_dir / "dem_filled.tif"
     wbt.breach_depressions_least_cost(
         dem=str(temp_dem),
-        output=str(breached_dem_raw),
+        output=str(breached_dem),
         dist=breach_dist,
         fill=True,
     )
 
-    breached_dem = temp_dir / "dem_filled.tif"
-    fix_whitebox_geotiff(breached_dem_raw, breached_dem, dem_crs, big_tiff)
-
-    breached_dem_raw.unlink()
+    logger.info(f"Using breach search distance of {breach_dist} cells")
     return breached_dem
 
 
@@ -237,28 +270,16 @@ def _calculate_flow_analysis(temp_dir: Path, filled_dem: Path, big_tiff: bool = 
     """Calculate D8 flow direction and accumulation."""
     logger.info("Calculating D8 flow direction and accumulation")
 
-    with rasterio.open(filled_dem) as src:
-        dem_crs = src.crs
-
     wbt = whitebox.WhiteboxTools()
     wbt.work_dir = str(temp_dir)
     wbt.verbose = True
     wbt.max_procs = -1
 
-    flow_pointer_raw = temp_dir / "d8_pointer_raw.tif"
-    wbt.d8_pointer(dem=str(filled_dem), output=str(flow_pointer_raw))
-
     flow_pointer = temp_dir / "d8_pointer.tif"
-    fix_whitebox_geotiff(flow_pointer_raw, flow_pointer, dem_crs, big_tiff)
-
-    flow_accum_raw = temp_dir / "d8_flow_accumulation_raw.tif"
-    wbt.d8_flow_accumulation(i=str(flow_pointer), output=str(flow_accum_raw), pntr=True)
+    wbt.d8_pointer(dem=str(filled_dem), output=str(flow_pointer))
 
     flow_accum = temp_dir / "d8_flow_accum.tif"
-    fix_whitebox_geotiff(flow_accum_raw, flow_accum, dem_crs, big_tiff)
-
-    flow_pointer_raw.unlink()
-    flow_accum_raw.unlink()
+    wbt.d8_flow_accumulation(i=str(flow_pointer), output=str(flow_accum), pntr=True)
 
     return flow_pointer, flow_accum
 
@@ -267,24 +288,17 @@ def _extract_streams(temp_dir: Path, flow_accum: Path, threshold: int, big_tiff:
     """Extract stream network."""
     logger.info("Extracting stream network")
 
-    with rasterio.open(flow_accum) as src:
-        flow_crs = src.crs
-
     wbt = whitebox.WhiteboxTools()
     wbt.work_dir = str(temp_dir)
     wbt.verbose = True
 
-    streams_raster_raw = temp_dir / "streams_raw.tif"
+    streams_raster = temp_dir / "streams.tif"
     wbt.extract_streams(
         flow_accum=str(flow_accum),
-        output=str(streams_raster_raw),
+        output=str(streams_raster),
         threshold=threshold,
     )
 
-    streams_raster = temp_dir / "streams.tif"
-    fix_whitebox_geotiff(streams_raster_raw, streams_raster, flow_crs, big_tiff)
-
-    streams_raster_raw.unlink()
     return streams_raster
 
 
@@ -327,9 +341,6 @@ def _process_watersheds(
     """
     logger.info("Processing watersheds using UnnestBasins tool")
 
-    with rasterio.open(d8_pointer) as src:
-        pointer_crs = src.crs
-
     wbt = whitebox.WhiteboxTools()
     wbt.work_dir = str(temp_dir)
     wbt.verbose = True
@@ -364,13 +375,10 @@ def _process_watersheds(
     for idx, ws_file in enumerate(sorted(file_list)):
         logger.info(f"Processing unnested basin file {idx + 1}/{len(file_list)}: {ws_file.name}")
 
-        ws_raster_fixed = temp_dir / f"watersheds_unnested_{idx + 1}_fixed.tif"
-        fix_whitebox_geotiff(ws_file, ws_raster_fixed, pointer_crs, big_tiff)
-
         ws_vector = temp_dir / f"watersheds_unnested_{idx + 1}.shp"
 
         try:
-            wbt.raster_to_vector_polygons(i=str(ws_raster_fixed), output=str(ws_vector))
+            wbt.raster_to_vector_polygons(i=str(ws_file), output=str(ws_vector))
             if ws_vector.exists():
                 ws_shp_tmp = gpd.read_file(ws_vector)
                 if not ws_shp_tmp.empty:
@@ -378,9 +386,6 @@ def _process_watersheds(
                     all_basin_parts.append(ws_shp_tmp)
         except Exception as e:
             logger.warning(f"Failed to convert basin {idx + 1}: {e}")
-
-        ws_raster_fixed.unlink(missing_ok=True)
-        ws_file.unlink(missing_ok=True)
 
     if all_basin_parts:
         ws_shp = pd.concat(all_basin_parts, ignore_index=True)
@@ -496,6 +501,16 @@ def _validate_inputs(dem_path: Path, gauges_path: Path, breach_dist: int, snap_d
         raise FileNotFoundError(f"Gauges shapefile not found: {gauges_path}")
     if breach_dist <= 0:
         raise ValueError("breach_dist must be positive")
+    if snap_dist <= 0:
+        raise ValueError("snap_dist must be positive")
+
+
+def _validate_inputs_for_filled_dem(filled_dem_path: Path, gauges_path: Path, snap_dist: float) -> None:
+    """Validate input parameters for filled DEM workflow."""
+    if not filled_dem_path.exists():
+        raise FileNotFoundError(f"Filled DEM file not found: {filled_dem_path}")
+    if not gauges_path.exists():
+        raise FileNotFoundError(f"Gauges shapefile not found: {gauges_path}")
     if snap_dist <= 0:
         raise ValueError("snap_dist must be positive")
 

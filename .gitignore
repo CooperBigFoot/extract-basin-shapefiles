@@ -12,3 +12,5 @@ wheels/
 .DS_Store
 
 debug
+
+extract_basin_shapefiles.egg-info
